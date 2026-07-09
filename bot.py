@@ -12,6 +12,7 @@ Handles, in one bot:
 Everything is stored in a local SQLite file (bot_data.db) so it survives restarts.
 """
 
+import json
 import logging
 import os
 import sqlite3
@@ -145,6 +146,24 @@ def all_known_users():
     rows = conn.execute("SELECT user_id, username, first_name FROM users").fetchall()
     conn.close()
     return rows
+
+
+def load_seed_members():
+    """One-time catch-up: if member_sync.py has produced members_seed.json,
+    load everyone in it into the users table so /tagall reaches silent
+    members who joined before the bot existed. Safe to run every startup —
+    it just updates existing records."""
+    seed_path = os.environ.get("MEMBERS_SEED_FILE", "members_seed.json")
+    if not os.path.exists(seed_path):
+        return
+    try:
+        with open(seed_path) as f:
+            members = json.load(f)
+        for m in members:
+            upsert_user(m["user_id"], m.get("username"), m.get("first_name"))
+        log.info(f"Loaded {len(members)} members from {seed_path} into tracking DB.")
+    except Exception as e:
+        log.error(f"Failed to load {seed_path}: {e}")
 
 
 def add_warning(user_id):
@@ -347,6 +366,70 @@ async def cmd_tagall(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 # ---------------------------------------------------------------------------
+# SHARED ESCALATION LOGIC — used by both automatic spam detection AND the
+# manual /warn command, so every violation (automatic or admin-issued) counts
+# toward the same 3-strike system: warn, warn, 7-day ban, then permanent removal.
+# ---------------------------------------------------------------------------
+async def apply_violation(context: ContextTypes.DEFAULT_TYPE, user_id: int, first_name: str, reason: str = ""):
+    violations = add_warning(user_id)
+    reason_line = f"\nReason: {reason}" if reason else ""
+
+    if violations <= 2:
+        await context.bot.send_message(
+            GROUP_CHAT_ID,
+            f"\u26A0\uFE0F {mention(user_id, first_name)}, you've received a warning.{reason_line}\n"
+            f"Warning {violations}/2 — a 3rd violation results in a 7-day ban, and a 4th results in "
+            f"permanent removal. Type /rules to review our guidelines.",
+            parse_mode="Markdown",
+        )
+    elif violations == 3:
+        until = datetime.utcnow() + timedelta(days=7)
+        await context.bot.ban_chat_member(GROUP_CHAT_ID, user_id, until_date=until)
+        await context.bot.send_message(
+            GROUP_CHAT_ID,
+            f"\U0001F6AB {mention(user_id, first_name)} has been banned for 7 days after repeated "
+            f"rule violations.{reason_line}",
+            parse_mode="Markdown",
+        )
+    else:
+        await context.bot.ban_chat_member(GROUP_CHAT_ID, user_id)
+        await context.bot.send_message(
+            GROUP_CHAT_ID,
+            f"\u274C {mention(user_id, first_name)} has been permanently removed after repeated rule "
+            f"violations following a prior 7-day ban.{reason_line}",
+            parse_mode="Markdown",
+        )
+    return violations
+
+
+# ---------------------------------------------------------------------------
+# MANUAL WARNING COMMAND (admins only)
+# Usage: reply to the offending member's message with:  /warn spamming links
+# ---------------------------------------------------------------------------
+async def cmd_warn(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await is_admin(update, context):
+        await update.message.reply_text("Only admins can use /warn.")
+        return
+
+    target_msg = update.message.reply_to_message
+    if target_msg is None or target_msg.from_user is None:
+        await update.message.reply_text(
+            "To warn someone, reply to one of their messages with /warn (optionally add a reason), "
+            "e.g.: /warn disrespecting another member"
+        )
+        return
+
+    target_user = target_msg.from_user
+    if target_user.id == context.bot.id:
+        await update.message.reply_text("I can't warn myself.")
+        return
+
+    reason = " ".join(update.message.text.split(" ")[1:])
+    upsert_user(target_user.id, target_user.username, target_user.first_name)
+    await apply_violation(context, target_user.id, target_user.first_name, reason)
+
+
+# ---------------------------------------------------------------------------
 # FEATURE 1: SPAM FILTER  +  activity tracking on every message
 # ---------------------------------------------------------------------------
 async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -364,7 +447,7 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     member = await context.bot.get_chat_member(GROUP_CHAT_ID, user.id)
     if member.status in (ChatMemberStatus.ADMINISTRATOR, ChatMemberStatus.OWNER):
-        return
+        return  # never moderate admins
 
     is_spam = any(k in text for k in SPAM_KEYWORDS)
     if is_spam:
@@ -372,33 +455,7 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await msg.delete()
         except Exception:
             pass
-        violations = add_warning(user.id)
-
-        if violations <= 2:
-            await context.bot.send_message(
-                GROUP_CHAT_ID,
-                f"\u26A0\uFE0F {mention(user.id, user.first_name)}, that message broke our community "
-                f"rules and was removed. Warning {violations}/2 — a 3rd violation results in a "
-                f"7-day ban, and a 4th results in permanent removal. Type /rules to review our guidelines.",
-                parse_mode="Markdown",
-            )
-        elif violations == 3:
-            until = datetime.utcnow() + timedelta(days=7)
-            await context.bot.ban_chat_member(GROUP_CHAT_ID, user.id, until_date=until)
-            await context.bot.send_message(
-                GROUP_CHAT_ID,
-                f"\U0001F6AB {mention(user.id, user.first_name)} has been banned for 7 days after "
-                f"repeated rule violations.",
-                parse_mode="Markdown",
-            )
-        else:
-            await context.bot.ban_chat_member(GROUP_CHAT_ID, user.id)
-            await context.bot.send_message(
-                GROUP_CHAT_ID,
-                f"\u274C {mention(user.id, user.first_name)} has been permanently removed after "
-                f"repeated rule violations following a prior 7-day ban.",
-                parse_mode="Markdown",
-            )
+        await apply_violation(context, user.id, user.first_name, reason="automated spam/scam detection")
 
 
 # ---------------------------------------------------------------------------
@@ -433,12 +490,14 @@ async def post_news_job(context: ContextTypes.DEFAULT_TYPE):
 # ---------------------------------------------------------------------------
 def main():
     init_db()
+    load_seed_members()
     application: Application = ApplicationBuilder().token(BOT_TOKEN).build()
 
     application.add_handler(CommandHandler("myreflink", cmd_myreflink))
     application.add_handler(CommandHandler("leaderboard", cmd_leaderboard))
     application.add_handler(CommandHandler("tagall", cmd_tagall))
     application.add_handler(CommandHandler("rules", cmd_rules))
+    application.add_handler(CommandHandler("warn", cmd_warn))
     application.add_handler(MessageHandler(filters.TEXT | filters.CAPTION, on_message))
     application.add_handler(ChatMemberHandler(on_chat_member_update, ChatMemberHandler.CHAT_MEMBER))
 
