@@ -35,14 +35,33 @@ from telegram.ext import (
     filters,
 )
 
+try:
+    from telethon import TelegramClient as TelethonClient
+    TELETHON_AVAILABLE = True
+except ImportError:
+    TELETHON_AVAILABLE = False
+
 # ---------------------------------------------------------------------------
 # CONFIG (all pulled from environment variables — see .env.example)
 # ---------------------------------------------------------------------------
 BOT_TOKEN = os.environ["BOT_TOKEN"]
 GROUP_CHAT_ID = int(os.environ["GROUP_CHAT_ID"])          # your community group id (negative number)
 NEWS_FEED_URLS = [u.strip() for u in os.environ.get("NEWS_FEED_URLS", "").split(",") if u.strip()]
-NEWS_INTERVAL_HOURS = float(os.environ.get("NEWS_INTERVAL_HOURS", "3"))
+NEWS_POST_HOUR = int(os.environ.get("NEWS_POST_HOUR", "10"))  # 24-hour, Africa/Lagos time — one post/day
 SPAM_KEYWORDS = [w.strip().lower() for w in os.environ.get("SPAM_KEYWORDS", "airdrop claim,free giveaway,dm me for,t.me/+").split(",") if w.strip()]
+
+# Opportunity scanning (contests, giveaways, ambassador programs) — ON DEMAND ONLY,
+# triggered by an admin typing /opportunities. Never runs automatically in the background.
+TG_API_ID = os.environ.get("TG_API_ID")
+TG_API_HASH = os.environ.get("TG_API_HASH")
+TARGET_CHANNELS = [c.strip() for c in os.environ.get("TARGET_CHANNELS", "").split(",") if c.strip()]
+PERSONAL_SESSION_NAME = os.environ.get("TG_SESSION_NAME", "member_sync_session")
+OPPORTUNITY_KEYWORDS = [
+    "contest", "giveaway", "airdrop", "referral", "bounty", "whitelist",
+    "reward", "prize", "campaign", "ambassador", "presale bonus",
+    "leaderboard", "win ", "earn ", "claim now", "free mint", "raffle",
+]
+opportunity_pattern = re.compile("|".join(re.escape(k) for k in OPPORTUNITY_KEYWORDS), re.IGNORECASE)
 
 DB_PATH = os.environ.get("DB_PATH", "bot_data.db")
 CALENDAR_FILE = os.environ.get("CALENDAR_FILE", "community_calendar.json")
@@ -481,7 +500,7 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 # ---------------------------------------------------------------------------
-# FEATURE 6: AUTO-POST NEWS FROM RSS FEEDS
+# FEATURE 6: ONE NEWS POST PER DAY (not a flood — just the single freshest item)
 # ---------------------------------------------------------------------------
 async def post_news_job(context: ContextTypes.DEFAULT_TYPE):
     for feed_url in NEWS_FEED_URLS:
@@ -495,6 +514,7 @@ async def post_news_job(context: ContextTypes.DEFAULT_TYPE):
             link = entry.get("link")
             if not link or already_posted(link):
                 continue
+            # Found the first fresh, unposted story — post just this one and stop for today.
             title = entry.get("title", "New update")
             summary = clean_summary(entry.get("summary", ""))
             await context.bot.send_message(
@@ -504,7 +524,10 @@ async def post_news_job(context: ContextTypes.DEFAULT_TYPE):
                 disable_web_page_preview=False,
             )
             mark_posted(link)
-            time.sleep(1)
+            log.info(f"Posted today's single news item: {title}")
+            return  # stop entirely — only one post per day, no matter how many feeds/entries remain
+
+    log.info("No fresh news found today — nothing posted.")
 
 
 # ---------------------------------------------------------------------------
@@ -553,6 +576,77 @@ async def cmd_today(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 # ---------------------------------------------------------------------------
+# FEATURE 8: ON-DEMAND OPPORTUNITY SCAN — /opportunities (admins only)
+# Scans your followed channels for contests/giveaways/airdrops ONLY when an
+# admin explicitly asks. Never runs automatically or in the background.
+# ---------------------------------------------------------------------------
+async def cmd_opportunities(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await is_admin(update, context):
+        await update.message.reply_text("Only admins can use /opportunities.")
+        return
+
+    if not TELETHON_AVAILABLE or not TG_API_ID or not TG_API_HASH:
+        await update.message.reply_text(
+            "Opportunity scanning isn't set up yet — it needs a one-time personal account "
+            "login (TG_API_ID / TG_API_HASH) and at least one channel in TARGET_CHANNELS."
+        )
+        return
+
+    if not TARGET_CHANNELS:
+        await update.message.reply_text(
+            "No channels configured to scan yet. Add channel usernames to TARGET_CHANNELS "
+            "(comma-separated, no @) in your Railway variables."
+        )
+        return
+
+    await update.message.reply_text("\U0001F50D Scanning for opportunities, one moment...")
+
+    client = TelethonClient(PERSONAL_SESSION_NAME, int(TG_API_ID), TG_API_HASH)
+    try:
+        await client.connect()
+        if not await client.is_user_authorized():
+            await update.message.reply_text(
+                "The personal account session isn't authorized yet. Run member_sync.py once "
+                "on a computer to log in, then upload the generated session file to your repo."
+            )
+            return
+
+        cutoff = datetime.utcnow() - timedelta(hours=48)
+        found = []
+        for channel_username in TARGET_CHANNELS:
+            try:
+                entity = await client.get_entity(channel_username)
+                async for msg in client.iter_messages(entity, limit=20):
+                    msg_date = msg.date.replace(tzinfo=None) if msg.date else None
+                    if msg_date and msg_date < cutoff:
+                        break
+                    text = msg.raw_text or ""
+                    if opportunity_pattern.search(text):
+                        found.append((channel_username, text[:300]))
+                        break  # one hit per channel is enough to surface it
+            except Exception as e:
+                log.error(f"Failed scanning @{channel_username}: {e}")
+            if len(found) >= 6:
+                break
+
+        if not found:
+            await update.message.reply_text("No fresh opportunities found in the last 48 hours.")
+            return
+
+        lines = ["\U0001F514 *Opportunities spotted:*\n"]
+        for src, text in found:
+            lines.append(f"From @{src}:\n{text}\n")
+        await update.message.reply_text("\n".join(lines)[:4000], parse_mode="Markdown")
+
+    except Exception as e:
+        log.error(f"/opportunities scan failed: {e}")
+        await update.message.reply_text("Something went wrong while scanning. Try again shortly.")
+    finally:
+        if client.is_connected():
+            await client.disconnect()
+
+
+# ---------------------------------------------------------------------------
 # STARTUP
 # ---------------------------------------------------------------------------
 def main():
@@ -566,12 +660,14 @@ def main():
     application.add_handler(CommandHandler("rules", cmd_rules))
     application.add_handler(CommandHandler("warn", cmd_warn))
     application.add_handler(CommandHandler("today", cmd_today))
+    application.add_handler(CommandHandler("opportunities", cmd_opportunities))
     application.add_handler(MessageHandler(filters.TEXT | filters.CAPTION, on_message))
     application.add_handler(ChatMemberHandler(on_chat_member_update, ChatMemberHandler.CHAT_MEMBER))
 
     if NEWS_FEED_URLS:
-        application.job_queue.run_repeating(
-            post_news_job, interval=NEWS_INTERVAL_HOURS * 3600, first=30
+        application.job_queue.run_daily(
+            post_news_job,
+            time=dtime(hour=NEWS_POST_HOUR, minute=0, tzinfo=NIGERIA_TZ),
         )
 
     if os.path.exists(CALENDAR_FILE):
