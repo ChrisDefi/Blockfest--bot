@@ -500,9 +500,29 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 # ---------------------------------------------------------------------------
-# FEATURE 6: ONE NEWS POST PER DAY (not a flood — just the single freshest item)
+# FEATURE 6: ONE NEWS POST PER DAY — matched to today's activity theme when possible
 # ---------------------------------------------------------------------------
+STOPWORDS = {
+    "the", "a", "an", "is", "are", "was", "were", "and", "or", "but", "of", "to",
+    "in", "on", "for", "with", "your", "you", "we", "us", "our", "today", "what",
+    "how", "did", "do", "does", "it", "this", "that", "be", "one", "at", "as",
+    "if", "no", "not", "just", "share", "drop", "post", "tell",
+}
+
+
+def extract_theme_keywords(activity_text: str) -> list:
+    words = re.findall(r"[a-zA-Z]{4,}", activity_text.lower())
+    return [w for w in words if w not in STOPWORDS]
+
+
 async def post_news_job(context: ContextTypes.DEFAULT_TYPE):
+    # Pull today's activity theme (if any) so we can prioritize a matching story
+    calendar = load_calendar()
+    today = datetime.now(NIGERIA_TZ).strftime("%Y-%m-%d")
+    entry = calendar.get(today)
+    theme_keywords = extract_theme_keywords(entry["activity"]) if entry else []
+
+    candidates = []  # (is_theme_match: bool, entry, link)
     for feed_url in NEWS_FEED_URLS:
         try:
             parsed = feedparser.parse(feed_url)
@@ -510,24 +530,33 @@ async def post_news_job(context: ContextTypes.DEFAULT_TYPE):
             log.error(f"Failed to parse feed {feed_url}: {e}")
             continue
 
-        for entry in parsed.entries[:5]:
-            link = entry.get("link")
+        for feed_entry in parsed.entries[:5]:
+            link = feed_entry.get("link")
             if not link or already_posted(link):
                 continue
-            # Found the first fresh, unposted story — post just this one and stop for today.
-            title = entry.get("title", "New update")
-            summary = clean_summary(entry.get("summary", ""))
-            await context.bot.send_message(
-                GROUP_CHAT_ID,
-                f"\U0001F4F0 *{title}*\n{summary}\n\n{link}",
-                parse_mode="Markdown",
-                disable_web_page_preview=False,
-            )
-            mark_posted(link)
-            log.info(f"Posted today's single news item: {title}")
-            return  # stop entirely — only one post per day, no matter how many feeds/entries remain
+            combined = f"{feed_entry.get('title', '')} {feed_entry.get('summary', '')}".lower()
+            is_match = any(kw in combined for kw in theme_keywords) if theme_keywords else False
+            candidates.append((is_match, feed_entry, link))
 
-    log.info("No fresh news found today — nothing posted.")
+    if not candidates:
+        log.info("No fresh news found today — nothing posted.")
+        return
+
+    # Prefer a story matching today's theme; otherwise just take the first fresh one.
+    theme_matches = [c for c in candidates if c[0]]
+    chosen_entry, chosen_link = (theme_matches[0][1], theme_matches[0][2]) if theme_matches \
+        else (candidates[0][1], candidates[0][2])
+
+    title = chosen_entry.get("title", "New update")
+    summary = clean_summary(chosen_entry.get("summary", ""))
+    await context.bot.send_message(
+        GROUP_CHAT_ID,
+        f"\U0001F4F0 *{title}*\n{summary}\n\n{chosen_link}",
+        parse_mode="Markdown",
+        disable_web_page_preview=False,
+    )
+    mark_posted(chosen_link)
+    log.info(f"Posted today's news item ({'theme match' if theme_matches else 'general'}): {title}")
 
 
 # ---------------------------------------------------------------------------
@@ -545,32 +574,38 @@ def load_calendar():
         return {}
 
 
+OPEN_ACTIVITY_TEXT = (
+    "Open Activity — no set theme today! Free chat: share what you're working on, "
+    "drop a question, post an opportunity you've found, or just say hi \U0001F44B"
+)
+
+
 async def post_daily_calendar_activity(context: ContextTypes.DEFAULT_TYPE):
     calendar = load_calendar()
-    today = datetime.now(NIGERIA_TZ).strftime("%Y-%m-%d")
+    now = datetime.now(NIGERIA_TZ)
+    today = now.strftime("%Y-%m-%d")
+    real_day_name = now.strftime("%A")  # always computed from the actual date — never trust stored labels
     entry = calendar.get(today)
-    if not entry:
-        log.info(f"No calendar activity scheduled for {today} — skipping.")
-        return
+    activity_text = entry["activity"] if entry else OPEN_ACTIVITY_TEXT
 
     await context.bot.send_message(
         GROUP_CHAT_ID,
-        f"\U0001F4C5 *Today's Community Activity — {entry['day_name']}*\n\n{entry['activity']}",
+        f"\U0001F4C5 *Today's Community Activity — {real_day_name}*\n\n{activity_text}",
         parse_mode="Markdown",
     )
-    log.info(f"Posted calendar activity for {today}")
+    log.info(f"Posted calendar activity for {today}" + ("" if entry else " (fallback: open activity)"))
 
 
 async def cmd_today(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Lets anyone manually check today's scheduled activity on demand."""
     calendar = load_calendar()
-    today = datetime.now(NIGERIA_TZ).strftime("%Y-%m-%d")
+    now = datetime.now(NIGERIA_TZ)
+    today = now.strftime("%Y-%m-%d")
+    real_day_name = now.strftime("%A")
     entry = calendar.get(today)
-    if not entry:
-        await update.message.reply_text("No community activity is scheduled for today.")
-        return
+    activity_text = entry["activity"] if entry else OPEN_ACTIVITY_TEXT
     await update.message.reply_text(
-        f"\U0001F4C5 *Today's Community Activity — {entry['day_name']}*\n\n{entry['activity']}",
+        f"\U0001F4C5 *Today's Community Activity — {real_day_name}*\n\n{activity_text}",
         parse_mode="Markdown",
     )
 
