@@ -590,7 +590,7 @@ async def post_daily_calendar_activity(context: ContextTypes.DEFAULT_TYPE):
 
     await context.bot.send_message(
         GROUP_CHAT_ID,
-        f"\U0001F4C5 *Today's Community Activity — {real_day_name}*\n\n{activity_text}",
+        f"*Today's Community Activity — {real_day_name}*\n\n{activity_text}",
         parse_mode="Markdown",
     )
     log.info(f"Posted calendar activity for {today}" + ("" if entry else " (fallback: open activity)"))
@@ -605,7 +605,7 @@ async def cmd_today(update: Update, context: ContextTypes.DEFAULT_TYPE):
     entry = calendar.get(today)
     activity_text = entry["activity"] if entry else OPEN_ACTIVITY_TEXT
     await update.message.reply_text(
-        f"\U0001F4C5 *Today's Community Activity — {real_day_name}*\n\n{activity_text}",
+        f"*Today's Community Activity — {real_day_name}*\n\n{activity_text}",
         parse_mode="Markdown",
     )
 
